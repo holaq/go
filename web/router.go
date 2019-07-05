@@ -394,6 +394,8 @@ func (this *Handler) IP() (ip string) {
 			}
 		}
 		this.ip = &ip
+	} else {
+		ip = *this.ip
 	}
 	return
 }
