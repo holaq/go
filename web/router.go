@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"zwei.ren/console"
 	"zwei.ren/log"
 	"zwei.ren/memory"
 )
@@ -46,14 +47,17 @@ var (
 	ReadTimeout             = time.Second * 600
 	WriteTimeout            = time.Second * 600
 
-	DefaultServer = new(HttpServer)
+	DefaultServer = &HttpServer{IsLog: true}
 
 	XmlParser func([]byte) (map[string]interface{}, error) = nil
 
-	err_UnknownCType = errors.New("Unknown Content Type")
+	err_UnknownCType           = errors.New("Unknown Content Type")
+	Err_HandleMetUnimplemented = errors.New("The handle method is not implemented")
 )
 
 type HttpServer struct {
+	IsLog bool
+
 	routers []*_Router
 	mux     *http.ServeMux
 	server  *http.Server
@@ -103,6 +107,7 @@ type IHandler interface {
 	GetIO() (*http.Request, http.ResponseWriter)
 	Prepare()
 	Handle()
+	IP() string
 	isOver() bool
 	getResponse() (statusCode int, resHeaders map[string][]string, resData interface{})
 
@@ -130,6 +135,7 @@ type Handler struct {
 	hasPostParams          bool
 	fileParams             map[string]*MultipartFileData
 	reqHeaders             map[string][]string
+	ip                     *string
 	hasReqHeaders          bool
 	Method                 string
 
@@ -205,6 +211,7 @@ func (this *Handler) SetStatus(status int) {
 }
 func (this *Handler) Prepare() {}
 func (this *Handler) Handle() {
+	panic(Err_HandleMetUnimplemented)
 }
 func (this *Handler) GetHeaderArr(key string) []string {
 	arr, exists := this.GetHeaders()[key]
@@ -333,23 +340,28 @@ func (this *Handler) GetPostParams() map[string]interface{} {
 
 func (this *Handler) GetPostStrParam(key string) (value string) {
 	val := this.GetPostParam(key)
-	value, _ = val.(string)
+	var isStr bool
+	if value, isStr = val.(string); !isStr {
+		value = fmt.Sprintf("%v", val)
+	}
 	return
 }
 
 func (this *Handler) GetPostIntParam(key string, defaultVal int) int {
 	if i, z := this.GetPostParams()[key]; z {
-		switch i.(type) {
+		switch v := i.(type) {
 		case float64:
-			return int(i.(float64))
+			return int(v)
 		case int:
-			return i.(int)
+			return v
 		case int64:
-			return int(i.(int64))
+			return int(v)
 		case string:
-			if r, e := strconv.Atoi(i.(string)); e == nil {
+			if r, e := strconv.Atoi(v); e == nil {
 				return r
 			}
+		default:
+			log.Error("Type of params[%s] is %T", key, i)
 		}
 	}
 	return defaultVal
@@ -374,11 +386,14 @@ func (this *Handler) GetBody() (body []byte) {
 }
 
 func (this *Handler) IP() (ip string) {
-	if ip = this.GetHeader("x-forwarded-for"); len(ip) == 0 {
-		ip = this.Request.RemoteAddr
-		if ind := strings.LastIndex(ip, ":"); ind != -1 {
-			ip = ip[:ind]
+	if this.ip == nil {
+		if ip = this.GetHeader("x-forwarded-for"); len(ip) == 0 {
+			ip = this.Request.RemoteAddr
+			if ind := strings.LastIndex(ip, ":"); ind != -1 {
+				ip = ip[:ind]
+			}
 		}
+		this.ip = &ip
 	}
 	return
 }
@@ -499,13 +514,24 @@ func (this *staticRouter) Handle() {
 	if paths := this.GetRouterPath(); len(paths) > 1 {
 		paths[1] = this.Folder
 		filePath := path.Join(paths[1:]...)
-		if info, e := os.Stat(filePath); e == nil {
-			if !info.IsDir() {
+		info, e := os.Stat(filePath)
+		if e == nil {
+			if info.IsDir() {
+				if path := this.Request.URL.Path; path[len(path)-1] != '/' {
+					this.Redirect(302, path+"/")
+					return
+				}
+				filePath = path.Join(filePath, "index.html")
+				info, e = os.Stat(filePath)
+			}
+			if e == nil {
 				if this.NoFilter || this.Filter(paths[2:], info) {
 					size := info.Size()
 
 					if this.ResHeaders == nil {
-						this.ResHeaders = map[string][]string{}
+						this.ResHeaders = map[string][]string{
+							"Content-Type": {mime.TypeByExtension(path.Ext(filePath))},
+						}
 					}
 
 					if this.OpenCache {
@@ -635,8 +661,6 @@ func (this *staticRouter) Handle() {
 				} else {
 					fmt.Printf("FilePath[%s] filter wrong\n", filePath)
 				}
-			} else {
-				fmt.Printf("FilePath[%s] is a dir ? : %v\n", filePath, info.IsDir())
 			}
 		} else {
 			fmt.Printf("FilePath[%s] stat failed: %v\n", filePath, e)
@@ -656,11 +680,25 @@ func (this *Handler) Redirect(code int, url string) {
 	this.ResponseStatus(code)
 }
 
+func checkBuilder(handlerBuilder func() IHandler) (e error) {
+	defer func() {
+		if _e := recover(); _e == Err_HandleMetUnimplemented {
+			e = Err_HandleMetUnimplemented
+		}
+	}()
+	handlerBuilder().Handle()
+	return
+}
+
 func AddRouter(httpPath string, handlerBuilder func() IHandler) {
 	DefaultServer.AddRouter(httpPath, handlerBuilder)
 }
 
 func (this *HttpServer) AddRouter(httpPath string, handlerBuilder func() IHandler) {
+	if e := checkBuilder(handlerBuilder); e != nil {
+		panic("Router [" + httpPath + "] wrong:" + e.Error())
+	}
+
 	if httpPath != "/" && (len(httpPath) < 2 || httpPath[0] != '/') {
 		panic("Router path must starts with '/'!  > " + httpPath)
 	}
@@ -702,7 +740,54 @@ func RouterRunWithTimeout(port int, readTimeout, writeTimeout time.Duration) err
 	return DefaultServer.RouterRunWithTimeout(port, readTimeout, writeTimeout)
 }
 
+func (this *HttpServer) log(
+	status_ptr *int, from time.Time,
+	request *http.Request,
+	handler *IHandler,
+) {
+	var addr, met string
+	if handler != nil && *handler != nil {
+		addr = (*handler).IP()
+	}
+	if len(addr) == 0 {
+		addr = request.RemoteAddr
+	}
+	met = request.Method
+
+	now := time.Now()
+
+	status := *status_ptr
+	var _status, _met string
+	if status < 200 || status > 399 {
+		_status = console.Red(strconv.Itoa(status))
+	} else {
+		_status = console.Magenta(strconv.Itoa(status))
+	}
+	switch met {
+	case "POST":
+		_met = console.Yellow(met)
+	case "PUT":
+		_met = console.Black(met)
+	case "DELETE":
+		_met = console.Magenta(met)
+	case "OPTIONS":
+		_met = console.Cyan(met)
+	default:
+		_met = console.Blue(met)
+	}
+	fmt.Printf(
+		"[Zwei.Ren/Web] %s | %3s | %12v |%21s | %5s | %s\n",
+		now.Format("2006-01-02 15:04:05"),
+		_status,
+		now.Sub(from),
+		addr,
+		_met,
+		console.Green(request.URL.String()),
+	)
+}
+
 func (this *HttpServer) RouterRunWithTimeout(port int, readTimeout, writeTimeout time.Duration) error {
+	isLog := this.IsLog
 	routers := this.routers
 	mux := this.mux
 	server := this.server
@@ -734,10 +819,16 @@ func (this *HttpServer) RouterRunWithTimeout(port int, readTimeout, writeTimeout
 		defer HandleException(request.RequestURI)
 		defer request.Body.Close()
 
+		status := 404
+		var handler IHandler
+		if isLog {
+			defer this.log(&status, time.Now(), request, &handler)
+		}
+
 		uri := request.URL.Path
 		uriLen := len(uri)
 		if uriLen == 0 {
-			writer.WriteHeader(404)
+			writer.WriteHeader(status)
 			return
 		}
 		if uri[uriLen-1] != '/' {
@@ -752,80 +843,118 @@ func (this *HttpServer) RouterRunWithTimeout(port int, readTimeout, writeTimeout
 			}
 		}
 		if rout == nil {
-			writer.WriteHeader(404)
+			writer.WriteHeader(status)
 			return
 		}
 
-		handler := rout.Builder()
+		handler = rout.Builder()
 		handler.initHandler(writer, request)
 		handler.Prepare()
 		if !handler.isOver() {
-			if cType := mime.TypeByExtension(path.Ext(request.URL.Path)); len(cType) != 0 {
-				handler.ResponseHeaders(map[string][]string{"Content-Type": []string{cType}})
-			}
-			handler.ResponseStatus(404)
 			handler.Handle()
 			if handler.ResponseNothing() {
 				return
 			}
+		}
 
-			status, headers, resData := handler.getResponse()
+		var headers map[string][]string
+		var resData interface{}
+		status, headers, resData = handler.getResponse()
+		if status < 1 {
+			status = 405
+		}
 
-			if headers != nil {
-				for hk, hv := range headers {
-					for _, v := range hv {
-						writer.Header().Add(hk, v)
-					}
+		// 指定了headers就不用自己找Content-Type了
+		// 未指定的情况下，如果是interface{}就json，否则是根据mime
+		isNoHeaders := headers == nil || len(headers) == 0
+
+		writeHeader := writer.Header()
+		if !isNoHeaders {
+			for hk, hv := range headers {
+				for _, v := range hv {
+					writeHeader.Add(hk, v)
 				}
 			}
-			writer.WriteHeader(status)
+		}
 
-			// fmt.Println("Ready to handle resData")
-
-			var writeBs []byte
-			var readStream *Stream
-			if resData != nil {
-				switch resData.(type) {
-				case string:
-					writeBs = []byte(resData.(string))
-				case []byte:
-					writeBs = resData.([]byte)
-				case *Stream:
-					readStream, _ = resData.(*Stream)
-				default:
-					writeBs, _ = json.Marshal(resData)
+		var writeBs []byte
+		var readStream *Stream
+		if resData != nil {
+			isNoJson := true
+			switch v := resData.(type) {
+			case string:
+				writeBs = []byte(v)
+			case []byte:
+				writeBs = v
+			case *Stream:
+				readStream = v
+			default:
+				writeBs, _ = json.Marshal(resData)
+				isNoJson = false
+			}
+			if isNoHeaders {
+				if isNoJson {
+					if cType := mime.TypeByExtension(path.Ext(request.URL.Path)); len(cType) != 0 {
+						writeHeader.Set(
+							"Content-Type",
+							cType,
+						)
+					}
+				} else {
+					writeHeader.Set(
+						"Content-Type",
+						"application/json",
+					)
 				}
 			}
-			if readStream == nil {
-				if len(writeBs) == 0 {
-					writeBs = []byte("Unknow Response")
-				}
-				writer.Write(writeBs)
-			} else {
-				defer readStream.Reader.Close()
-				buffSize := readStream.BuffSize
-				if buffSize < 1 {
-					buffSize = StreamBuffSize
-				}
-				buff := make([]byte, buffSize)
-				var rc, wc int
-				var e error
-				for {
-					if rc, e = readStream.Reader.Read(buff); rc != 0 {
-						if wc, e = writer.Write(buff[:rc]); wc != rc {
-							break
-						}
-					}
-					if e != nil {
+		}
+		writer.WriteHeader(status)
+
+		if readStream == nil {
+			if writeBs == nil || len(writeBs) == 0 {
+				writeBs = []byte("Unknown Response")
+			}
+			writer.Write(writeBs)
+		} else {
+			defer readStream.Reader.Close()
+			buffSize := readStream.BuffSize
+			if buffSize < 1 {
+				buffSize = StreamBuffSize
+			}
+			buff := make([]byte, buffSize)
+			var rc, wc int
+			var e error
+			for {
+				if rc, e = readStream.Reader.Read(buff); rc != 0 {
+					if wc, e = writer.Write(buff[:rc]); wc != rc {
 						break
 					}
+				}
+				if e != nil {
+					break
 				}
 			}
 		}
 	})
 
 	server.Handler = mux
-	return server.ListenAndServe()
+
+	fmt.Println(
+		console.Cyan("[Zwei.Ren/Web] Running on port ") +
+			console.Magenta(strconv.Itoa(port)) +
+			console.Cyan(" with ") +
+			console.Blue(strconv.Itoa(len(routers))) +
+			console.Cyan(" routers."),
+	)
+	e := server.ListenAndServe()
+	fmt.Println(
+		console.Red("[Zwei.Ren/Web] Stop service on port ") +
+			console.Magenta(strconv.Itoa(port)) +
+			console.Red(" with error: ") +
+			console.Blue(e.Error()) +
+			console.Red("."),
+	)
+	return e
 }
 
 func Run(port int) error {
