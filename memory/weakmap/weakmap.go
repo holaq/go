@@ -1,4 +1,5 @@
-package memory
+// Author: Zwei.Ren
+package weakmap
 
 import (
 	"fmt"
@@ -182,5 +183,89 @@ func (m *weakMap) Range(f func(key, value interface{}) bool) {
 		if !f(key, value.o) {
 			return
 		}
+	}
+}
+
+func CopyMap(from Map, to map[interface{}]interface{}) {
+	if from == nil || to == nil {
+		return
+	}
+	if weak, is := from.(*weakMap); is {
+		weak.Lock()
+		defer weak.Unlock()
+		for key, value := range weak.m {
+			to[key] = value.o
+		}
+	} else {
+		from.Range(func(k, v interface{}) bool {
+			to[k] = v
+			return true
+		})
+	}
+}
+
+func Keys(m Map) []interface{} {
+	if m == nil {
+		return []interface{}{}
+	}
+	if weak, is := m.(*weakMap); is {
+		weak.Lock()
+		defer weak.Unlock()
+		res := make([]interface{}, 0, weak.count)
+		for key, _ := range weak.m {
+			res = append(res, key)
+		}
+		return res
+	} else {
+		res := make([]interface{}, 0, 100)
+		m.Range(func(k, _ interface{}) bool {
+			res = append(res, k)
+			return true
+		})
+		return res
+	}
+}
+
+func Values(m Map) []interface{} {
+	if m == nil {
+		return []interface{}{}
+	}
+	if weak, is := m.(*weakMap); is {
+		weak.Lock()
+		defer weak.Unlock()
+		res := make([]interface{}, 0, weak.count)
+		for _, val := range weak.m {
+			res = append(res, val)
+		}
+		return res
+	} else {
+		res := make([]interface{}, 0, 100)
+		m.Range(func(_, v interface{}) bool {
+			res = append(res, v)
+			return true
+		})
+		return res
+	}
+}
+
+func StringKeys(m Map) []string {
+	if m == nil {
+		return []string{}
+	}
+	if weak, is := m.(*weakMap); is {
+		weak.Lock()
+		defer weak.Unlock()
+		res := make([]string, 0, weak.count)
+		for key, _ := range weak.m {
+			res = append(res, key.(string))
+		}
+		return res
+	} else {
+		res := make([]string, 0, 100)
+		m.Range(func(k, _ interface{}) bool {
+			res = append(res, k.(string))
+			return true
+		})
+		return res
 	}
 }
